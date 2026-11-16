@@ -116,6 +116,17 @@
       font-size: 14px;
     }
 
+    .guide-control {
+      cursor: pointer;
+      user-select: none;
+    }
+
+    input[type="checkbox"] {
+      margin: 0;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
     .status {
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -361,6 +372,14 @@
       <button id="undo-point" type="button" disabled>Undo Point</button>
       <button id="recrop" type="button" disabled>Adjust Crop</button>
       <button id="clear-active" type="button" disabled>Clear Active</button>
+      <label
+        class="export-control guide-control"
+        for="guide-grid"
+        title="Overlay the official crop guide (Poliisin passikuvaohje, page 3) on the finished photo. Preview only: never added to downloads or print sheets."
+      >
+        <input id="guide-grid" type="checkbox" checked>
+        Guide grid
+      </label>
       <label class="export-control" for="export-mode">
         JPEG export
         <select id="export-mode">
@@ -466,7 +485,37 @@
     const PRINT_DPI = 300;
     const ABOVE_CROWN = 70;
     const FACE_HEIGHT = 473;
-    const STORAGE_KEY = "passportgen.workflow.v2";
+    // Review guide from Poliisin passikuvaohje, page 3, in the 500 x 653 px photo frame.
+    // Crown must sit 56-84 px (4-6 mm) below the top edge, the chin 96-124 px (7-9 mm)
+    // above the bottom edge, and the face centre line within 21 px (1.5 mm) of the middle.
+    const GUIDE = {
+      crownZone: [56, 84],
+      chinZone: [PHOTO_HEIGHT - 124, PHOTO_HEIGHT - 96],
+      centerTolerance: 21,
+      outerHalfWidth: 157.5,
+      innerHalfWidth: 106,
+      centerLineTop: 112,
+      centerLineBottom: 506,
+      color: "rgba(255, 82, 48, 0.95)",
+      halo: "rgba(255, 255, 255, 0.6)",
+      fill: "rgba(255, 82, 48, 0.13)",
+      font: '12px system-ui, -apple-system, "Segoe UI", sans-serif',
+      labelColor: "#d7dbe1",
+      bracketColor: "#8f96a1",
+      // Below this photo width on screen the margins for the labels are not worth it.
+      minLabelledWidth: 260
+    };
+    // Measurements printed to the right of the guide diagram. Spans that touch share a
+    // bracket column, so the second column keeps neighbouring brackets apart.
+    const GUIDE_RIGHT_SPANS = [
+      { from: 0, to: GUIDE.crownZone[0], label: "56 px (4 mm)", column: 0 },
+      { from: GUIDE.crownZone[0], to: GUIDE.crownZone[1], label: "28 px (2 mm)", column: 1 },
+      { from: GUIDE.crownZone[1], to: GUIDE.chinZone[0], label: "445 px (32 mm)", column: 0 },
+      { from: GUIDE.chinZone[0], to: GUIDE.chinZone[1], label: "28 px (2 mm)", column: 1 },
+      { from: GUIDE.chinZone[1], to: PHOTO_HEIGHT, label: "96 px (7 mm)", column: 0 }
+    ];
+    const PREFERENCES_KEY = "passportgen.preferences.v1";
+    const LEGACY_WORKFLOW_KEY = "passportgen.workflow.v2";
     const PANEL_WIDTH_KEY = "passportgen.sidePanelWidth.v1";
     const PAPER_SIZES = {
       "9x13": { label: "9 x 13 cm", widthMm: 90, heightMm: 130 },
@@ -480,6 +529,7 @@
     const recropButton = document.getElementById("recrop");
     const clearActiveButton = document.getElementById("clear-active");
     const exportModeSelect = document.getElementById("export-mode");
+    const guideToggle = document.getElementById("guide-grid");
     const downloadButton = document.getElementById("download");
     const paperSizeSelect = document.getElementById("paper-size");
     const sheetNameInput = document.getElementById("sheet-name");
@@ -513,6 +563,7 @@
     let slots = [createSlot("A"), createSlot("B")];
     let workingCanvas = document.createElement("canvas");
     let displayPoints = [];
+    let showingResult = false;
     let resultUrl = "";
     let sheetUrl = "";
     let view = { scale: 1, offsetX: 0, offsetY: 0 };
@@ -923,6 +974,161 @@
       return exportResult;
     }
 
+    // Draws the official review guide over the finished photo. Positions are given in the
+    // 500 x 653 px frame, so they also fit the "original pixels" result of any size.
+    function drawGuideOverlay(drawWidth, drawHeight) {
+      const scaleX = drawWidth / PHOTO_WIDTH;
+      const scaleY = drawHeight / PHOTO_HEIGHT;
+      const toX = (x) => view.offsetX + x * scaleX;
+      const toY = (y) => view.offsetY + y * scaleY;
+      const centerX = PHOTO_WIDTH / 2;
+      const outer = GUIDE.outerHalfWidth;
+      const inner = GUIDE.innerHalfWidth;
+      const tolerance = GUIDE.centerTolerance;
+
+      ctx.save();
+
+      ctx.fillStyle = GUIDE.fill;
+      for (const [top, bottom] of [GUIDE.crownZone, GUIDE.chinZone]) {
+        ctx.fillRect(toX(centerX - outer), toY(top), 2 * outer * scaleX, (bottom - top) * scaleY);
+      }
+      ctx.fillRect(
+        toX(centerX - tolerance),
+        toY(GUIDE.centerLineTop),
+        2 * tolerance * scaleX,
+        (GUIDE.centerLineBottom - GUIDE.centerLineTop) * scaleY
+      );
+
+      // Long lines are the outer limits, short lines the inner ones, as in the printed guide.
+      const horizontalLines = [
+        [GUIDE.crownZone[0], outer],
+        [GUIDE.crownZone[1], inner],
+        [GUIDE.chinZone[0], inner],
+        [GUIDE.chinZone[1], outer]
+      ];
+      ctx.beginPath();
+      for (const [y, halfWidth] of horizontalLines) {
+        ctx.moveTo(toX(centerX - halfWidth), toY(y));
+        ctx.lineTo(toX(centerX + halfWidth), toY(y));
+      }
+      for (const x of [centerX - tolerance, centerX + tolerance]) {
+        ctx.moveTo(toX(x), toY(GUIDE.centerLineTop));
+        ctx.lineTo(toX(x), toY(GUIDE.centerLineBottom));
+      }
+      ctx.lineCap = "butt";
+      ctx.strokeStyle = GUIDE.halo;
+      ctx.lineWidth = 4;
+      ctx.stroke();
+      ctx.strokeStyle = GUIDE.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    // Space the dimension labels need around the photo, plus where each bracket and label
+    // sits. Offsets are in screen pixels, measured from the photo's left or right edge.
+    function getGuideLabelLayout() {
+      ctx.save();
+      ctx.font = GUIDE.font;
+      const textWidth = (text) => ctx.measureText(text).width;
+      const innerWidth = Math.max(textWidth("500 px"), textWidth("(36 mm)"));
+      const outerWidth = Math.max(textWidth("653 px"), textWidth("(47 mm)"));
+      const rightWidth = Math.max(...GUIDE_RIGHT_SPANS.map((span) => textWidth(span.label)));
+      ctx.restore();
+
+      const gap = 6;
+      const innerBracketX = -8;
+      const innerLabelX = innerBracketX - gap;
+      const outerBracketX = innerLabelX - innerWidth - gap;
+      const outerLabelX = outerBracketX - gap;
+      const rightLabelX = 26;
+      return {
+        innerBracketX,
+        innerLabelX,
+        outerBracketX,
+        outerLabelX,
+        rightLabelX,
+        left: Math.ceil(-(outerLabelX - outerWidth)) + 4,
+        right: Math.ceil(rightLabelX + rightWidth) + 4,
+        top: 30,
+        bottom: 50
+      };
+    }
+
+    // Brackets and px / mm labels as printed around the diagram in the official guide.
+    // The px values are for the 500 x 653 px photo service image, whatever the export size.
+    function drawGuideLabels(drawWidth, drawHeight, layout) {
+      const scaleX = drawWidth / PHOTO_WIDTH;
+      const scaleY = drawHeight / PHOTO_HEIGHT;
+      const left = view.offsetX;
+      const right = view.offsetX + drawWidth;
+      const top = view.offsetY;
+      const bottom = view.offsetY + drawHeight;
+      const toX = (x) => left + x * scaleX;
+      const toY = (y) => top + y * scaleY;
+      const centerX = PHOTO_WIDTH / 2;
+      const bandRight = centerX + GUIDE.centerTolerance;
+      const tick = 5;
+      const [crownTop] = GUIDE.crownZone;
+      const chinBottom = GUIDE.chinZone[1];
+
+      ctx.save();
+
+      const verticalBracket = (x, from, to, tickDx) => {
+        ctx.moveTo(x + tickDx, toY(from));
+        ctx.lineTo(x, toY(from));
+        ctx.lineTo(x, toY(to));
+        ctx.lineTo(x + tickDx, toY(to));
+      };
+      const horizontalBracket = (y, from, to, tickDy) => {
+        ctx.moveTo(toX(from), y + tickDy);
+        ctx.lineTo(toX(from), y);
+        ctx.lineTo(toX(to), y);
+        ctx.lineTo(toX(to), y + tickDy);
+      };
+
+      ctx.strokeStyle = GUIDE.bracketColor;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (const span of GUIDE_RIGHT_SPANS) {
+        verticalBracket(right + 8 + span.column * 10, span.from, span.to, -tick);
+      }
+      verticalBracket(left + layout.innerBracketX, crownTop, chinBottom, tick);
+      verticalBracket(left + layout.outerBracketX, 0, PHOTO_HEIGHT, tick);
+      horizontalBracket(top - 8, 0, PHOTO_WIDTH, tick);
+      horizontalBracket(bottom + 8, bandRight, PHOTO_WIDTH, -tick);
+      horizontalBracket(bottom + 16, centerX - GUIDE.centerTolerance, bandRight, -tick);
+      ctx.stroke();
+
+      ctx.fillStyle = GUIDE.labelColor;
+      ctx.font = GUIDE.font;
+
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      for (const span of GUIDE_RIGHT_SPANS) {
+        ctx.fillText(span.label, right + layout.rightLabelX, toY((span.from + span.to) / 2));
+      }
+
+      ctx.textAlign = "right";
+      const stackedLabel = (x, from, to, upper, lower) => {
+        const y = toY((from + to) / 2);
+        ctx.fillText(upper, x, y - 7);
+        ctx.fillText(lower, x, y + 7);
+      };
+      stackedLabel(left + layout.innerLabelX, crownTop, chinBottom, "500 px", "(36 mm)");
+      stackedLabel(left + layout.outerLabelX, 0, PHOTO_HEIGHT, "653 px", "(47 mm)");
+
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.fillText("500 px (36 mm)", toX(centerX), top - 14);
+      ctx.textBaseline = "top";
+      ctx.fillText("229 px (16.5 mm)", toX((bandRight + PHOTO_WIDTH) / 2), bottom + 14);
+      ctx.fillText("42 px (3 mm)", toX(centerX), bottom + 29);
+
+      ctx.restore();
+    }
+
     function draw() {
       const rect = canvas.getBoundingClientRect();
       ctx.clearRect(0, 0, rect.width, rect.height);
@@ -934,18 +1140,39 @@
         return;
       }
 
-      const scale = Math.min(rect.width / workingCanvas.width, rect.height / workingCanvas.height);
+      const fitScale = (pad) => Math.min(
+        (rect.width - pad.left - pad.right) / workingCanvas.width,
+        (rect.height - pad.top - pad.bottom) / workingCanvas.height
+      );
+
+      // With the guide on, leave margins for the dimension labels if the preview is big
+      // enough to stay readable; otherwise only the lines are drawn.
+      const guideOn = showingResult && guideToggle.checked;
+      let labelLayout = guideOn ? getGuideLabelLayout() : null;
+      if (labelLayout && fitScale(labelLayout) * workingCanvas.width < GUIDE.minLabelledWidth) {
+        labelLayout = null;
+      }
+      const pad = labelLayout || { left: 0, right: 0, top: 0, bottom: 0 };
+
+      const scale = fitScale(pad);
       const drawWidth = workingCanvas.width * scale;
       const drawHeight = workingCanvas.height * scale;
       view = {
         scale,
-        offsetX: (rect.width - drawWidth) / 2,
-        offsetY: (rect.height - drawHeight) / 2
+        offsetX: pad.left + (rect.width - pad.left - pad.right - drawWidth) / 2,
+        offsetY: pad.top + (rect.height - pad.top - pad.bottom - drawHeight) / 2
       };
 
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
       ctx.drawImage(workingCanvas, view.offsetX, view.offsetY, drawWidth, drawHeight);
+
+      if (guideOn) {
+        drawGuideOverlay(drawWidth, drawHeight);
+      }
+      if (labelLayout) {
+        drawGuideLabels(drawWidth, drawHeight, labelLayout);
+      }
 
       ctx.fillStyle = "#ffcc00";
       for (const point of displayPoints) {
@@ -1018,7 +1245,10 @@
         return `Open a portrait photo in slot ${slot.label} to begin.`;
       }
       if (slot.resultCanvases) {
-        return `Photo ${slot.label} is ready. Adjust it, switch slots, or download the layout.`;
+        const guideHint = guideToggle.checked
+          ? " Guide grid: crown and chin between the line pairs, nose between the vertical lines."
+          : "";
+        return `Photo ${slot.label} is ready. Adjust it, switch slots, or download the layout.${guideHint}`;
       }
       if (slot.eyePoints.length === 0) {
         return `Photo ${slot.label}: click the center of one eye.`;
@@ -1058,6 +1288,7 @@
       updateAdjustmentControls();
       clearActiveButton.disabled = !slot.rawDataUrl;
       recropButton.disabled = !slot.resultCanvases;
+      showingResult = false;
 
       if (!slot.rawDataUrl || !slot.rawCanvas) {
         workingCanvas = document.createElement("canvas");
@@ -1072,6 +1303,7 @@
       if (slot.resultCanvases && !options.forceCropView) {
         workingCanvas = getExportCanvas(slot) || slot.resultCanvases.official;
         displayPoints = [];
+        showingResult = true;
       } else if (slot.eyePoints.length < 2) {
         workingCanvas = slot.rawCanvas;
         displayPoints = slot.eyePoints.map(clonePoint);
@@ -1092,22 +1324,11 @@
       draw();
     }
 
-    function serializeWorkflow() {
+    function serializePreferences() {
       return {
-        activeSlotIndex,
         exportMode: exportModeSelect.value,
         paperSize: paperSizeSelect.value,
-        sheetName: sheetNameInput.value,
-        slots: slots.map((slot) => ({
-          label: slot.label,
-          rawDataUrl: slot.rawDataUrl,
-          name: slot.name,
-          outputName: slot.outputName,
-          eyePoints: slot.eyePoints,
-          cropPoints: slot.cropPoints,
-          brightness: slot.brightness,
-          contrast: slot.contrast
-        }))
+        showGuide: guideToggle.checked
       };
     }
 
@@ -1116,30 +1337,16 @@
         return;
       }
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeWorkflow()));
+        localStorage.removeItem(LEGACY_WORKFLOW_KEY);
+        localStorage.setItem(PREFERENCES_KEY, JSON.stringify(serializePreferences()));
       } catch (error) {
-        setStatus(
-          "Workflow is too large for browser autosave. Exports still work, but reload restore may be incomplete."
-        );
-      }
-    }
-
-    async function hydrateSlot(slot) {
-      if (!slot.rawDataUrl) {
-        return;
-      }
-      slot.image = await loadImageFromDataUrl(slot.rawDataUrl);
-      slot.rawCanvas = createCanvasFromImage(slot.image);
-      if (slot.eyePoints.length >= 2) {
-        updateSlotRotation(slot);
-      }
-      if (slot.eyePoints.length >= 2 && slot.cropPoints.length >= 2) {
-        generateSlotOutputs(slot);
+        setStatus("Preferences could not be saved. Exports still work normally.");
       }
     }
 
     async function restoreWorkflow() {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      const saved = localStorage.getItem(PREFERENCES_KEY) || localStorage.getItem(LEGACY_WORKFLOW_KEY);
+      localStorage.removeItem(LEGACY_WORKFLOW_KEY);
       if (!saved) {
         return;
       }
@@ -1147,31 +1354,12 @@
       try {
         restoring = true;
         const parsed = JSON.parse(saved);
-        activeSlotIndex = Number.isInteger(parsed.activeSlotIndex) ? parsed.activeSlotIndex : 0;
         exportModeSelect.value = parsed.exportMode || "official";
         paperSizeSelect.value = parsed.paperSize || "10x15";
-        sheetNameInput.value = parsed.sheetName || sheetNameInput.value || getDefaultSheetName();
-        slots = [createSlot("A"), createSlot("B")];
-        (parsed.slots || []).slice(0, 2).forEach((savedSlot, index) => {
-          slots[index] = {
-            ...slots[index],
-            rawDataUrl: savedSlot.rawDataUrl || "",
-            name: savedSlot.name || "",
-            outputName: savedSlot.outputName || `photo_${slots[index].label.toLowerCase()}_passport.jpg`,
-            eyePoints: (savedSlot.eyePoints || []).map(clonePoint),
-            cropPoints: (savedSlot.cropPoints || []).map(clonePoint),
-            brightness: Number(savedSlot.brightness) || 100,
-            contrast: Number(savedSlot.contrast) || 100
-          };
-        });
-        for (const slot of slots) {
-          await hydrateSlot(slot);
-        }
+        guideToggle.checked = parsed.showGuide !== false;
       } catch (error) {
-        localStorage.removeItem(STORAGE_KEY);
-        slots = [createSlot("A"), createSlot("B")];
-        activeSlotIndex = 0;
-        setStatus("Saved workflow could not be restored, so a fresh workflow was started.");
+        localStorage.removeItem(PREFERENCES_KEY);
+        setStatus("Saved preferences could not be restored, so defaults were used.");
       } finally {
         restoring = false;
       }
@@ -1443,6 +1631,15 @@
     exportModeSelect.addEventListener("change", () => {
       saveWorkflow();
       renderActiveSlot({ keepStatus: true });
+    });
+
+    guideToggle.addEventListener("change", () => {
+      const slot = getActiveSlot();
+      saveWorkflow();
+      if (slot.resultCanvases) {
+        setStatus(getNextInstruction(slot));
+      }
+      draw();
     });
 
     paperSizeSelect.addEventListener("change", () => {
